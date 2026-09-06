@@ -1,0 +1,71 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches:
+      - main          # Deploy automatically on every push to main
+  workflow_dispatch:  # Also allow manual deploys from the GitHub Actions UI
+
+# Prevent multiple deploys running at the same time
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Sync to S3 + Invalidate CloudFront
+    runs-on: ubuntu-latest
+
+    # Minimal permissions — only what this job needs
+    permissions:
+      contents: read
+
+    steps:
+      # 1. Check out the repository code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Configure AWS credentials from GitHub secrets
+      #    Go to: Settings → Secrets → Actions → New repository secret
+      #    Add: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            eu-west-2   # Change to match your var.aws_region
+
+      # 3. Sync the website folder to S3
+      #    --delete removes any files from S3 that no longer exist locally
+      #    --cache-control sets browser caching headers (1 year for assets, no cache for HTML)
+      - name: Sync website to S3
+        run: |
+          # Sync HTML files with no-cache so visitors always get the latest version
+          aws s3 sync ./website s3://${{ secrets.S3_BUCKET_NAME }} \
+            --delete \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+          # Sync CSS, JS, and image assets with long-lived cache (1 year)
+          # These files should be cache-busted by renaming when they change
+          aws s3 sync ./website s3://${{ secrets.S3_BUCKET_NAME }} \
+            --delete \
+            --exclude "*.html" \
+            --cache-control "public, max-age=31536000, immutable"
+
+      # 4. Invalidate CloudFront cache
+      #    CloudFront caches your files at edge locations worldwide.
+      #    After uploading new files to S3, we tell CloudFront to flush its cache
+      #    so visitors get the new version immediately (rather than waiting for TTL to expire).
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+      # 5. Print the live URL so it shows up in the Actions log
+      - name: Print live URL
+        run: |
+          echo "✅ Deployment complete!"
+          echo "🌍 Your site is live at: https://${{ secrets.CLOUDFRONT_DOMAIN }}"
